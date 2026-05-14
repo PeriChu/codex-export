@@ -30,13 +30,67 @@ This tool flattens a session into:
 
 ## Install
 
-Recommended, once this repo is pushed:
+Recommended install uses `pipx`, so the `codex-export` command is available
+globally without mixing dependencies into your normal Python environment.
 
-```bash
-pipx install git+https://github.com/PeriChu/codex-export.git
+### 1. Install pipx
+
+Windows PowerShell:
+
+```powershell
+py -m pip install --user pipx
+py -m pipx ensurepath
 ```
 
-Or run directly from a clone:
+Close and reopen PowerShell after `ensurepath`.
+
+macOS / Linux:
+
+```bash
+brew install pipx
+pipx ensurepath
+```
+
+If you do not use Homebrew:
+
+```bash
+python3 -m pip install --user pipx
+python3 -m pipx ensurepath
+```
+
+### 2. Install codex-export
+
+macOS / Linux:
+
+```bash
+pipx install "git+https://github.com/PeriChu/codex-export.git@macos"
+```
+
+Windows PowerShell:
+
+```powershell
+pipx install "git+https://github.com/PeriChu/codex-export.git@windows"
+```
+
+If GitHub cloning is unstable on Windows, download the Windows branch ZIP and
+install from the extracted folder:
+
+```powershell
+Invoke-WebRequest `
+  -Uri "https://github.com/PeriChu/codex-export/archive/refs/heads/windows.zip" `
+  -OutFile "$env:TEMP\codex-export-windows.zip"
+
+Expand-Archive "$env:TEMP\codex-export-windows.zip" -DestinationPath "$env:TEMP" -Force
+pipx install "$env:TEMP\codex-export-windows"
+```
+
+Confirm the command is installed:
+
+```bash
+codex-export --help
+```
+
+Or run directly from a clone without installing:
 
 ```bash
 python3 codex_export.py --help

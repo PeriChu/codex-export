@@ -1,7 +1,7 @@
 # codex-export
 
 Export local Codex sessions to clean HTML / Markdown / JSON / CSV bundles, with
-the raw JSONL transcript and readable local attachments packaged alongside.
+the raw JSONL transcript plus readable input and output files packaged alongside.
 
 Zero dependencies. Pure Python stdlib, 3.9+. One file, one command.
 
@@ -25,8 +25,8 @@ This tool flattens a session into:
   `session.json` and `transcript.jsonl`.
 - `metadata.json` - extracted session metadata.
 - `transcript.jsonl` - the lossless raw Codex source.
-- `attachments/` and `assets/` - readable local images and files inferred from
-  edit tool calls.
+- `inputs/` and `outputs/` - readable files mentioned by the user, local image
+  inputs, viewed/generated files, and files inferred from edit tool calls.
 
 ## Install
 
@@ -60,7 +60,7 @@ codex-export export all --output ./exports
 # choose formats
 codex-export export latest --formats html,json
 
-# transcript-only bundle, no local attachments or inferred file snapshots
+# transcript-only bundle, no copied input/output files
 codex-export export latest --no-files
 
 # include developer/system context in rendered outputs
@@ -86,8 +86,8 @@ exports/<session-id>/
 |-- session.csv
 |-- metadata.json
 |-- transcript.jsonl
-|-- attachments/
-`-- assets/
+|-- inputs/
+`-- outputs/
 ```
 
 ## Where Codex Data Lives

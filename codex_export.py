@@ -24,7 +24,7 @@ import re
 import shutil
 import sys
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Template
@@ -156,6 +156,7 @@ class FlatBlock:
 class Attachment:
     source: str
     kind: str
+    name: str = ""
     bundle_path: str = ""
     exists: bool = False
     size: int = 0
@@ -257,6 +258,12 @@ def _preview(text: str, limit: int = 80) -> str:
     if len(one) <= limit:
         return one
     return one[: max(0, limit - 3)] + "..."
+
+
+def _preview_plain(text: str, limit: int = 80) -> str:
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text or "")
+    text = text.replace("**", "").replace("__", "").replace("`", "")
+    return _preview(text, limit)
 
 
 def _clean_display_user_text(text: str) -> str:
@@ -805,38 +812,48 @@ def _clean_rel(path: Path) -> str:
     return "/".join(parts)
 
 
-def collect_attachments(raw: list[dict[str, Any]], cwd: str) -> list[Attachment]:
+def collect_input_files(raw: list[dict[str, Any]], cwd: str) -> list[Attachment]:
     seen: set[str] = set()
     out: list[Attachment] = []
 
-    def add(value: Any, kind: str) -> None:
+    def add(value: Any, kind: str, display_name: str = "") -> None:
         if value is None:
             return
-        candidates: list[str] = []
+        candidates: list[tuple[str, str]] = []
         if isinstance(value, str):
-            candidates.append(value)
+            candidates.append((value, display_name))
         elif isinstance(value, dict):
             for key in ("path", "file", "url", "image_url"):
                 if isinstance(value.get(key), str):
-                    candidates.append(value[key])
+                    candidates.append((value[key], display_name or str(value.get("name") or "")))
         elif isinstance(value, list):
             for item in value:
                 add(item, kind)
             return
-        for raw_path in candidates:
+        for raw_path, name in candidates:
             if not raw_path or raw_path in seen:
                 continue
             seen.add(raw_path)
             if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", raw_path):
-                out.append(Attachment(source=raw_path, kind=kind, exists=False))
+                out.append(Attachment(source=raw_path, kind=kind, name=name, exists=False))
                 continue
             p = _resolve_path(raw_path, cwd)
             exists = p.exists()
             size = p.stat().st_size if exists and p.is_file() else 0
-            out.append(Attachment(source=str(p), kind=kind, exists=exists, size=size))
+            out.append(Attachment(source=str(p), kind=kind, name=name or p.name, exists=exists, size=size))
 
     for obj in raw:
         payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+        if obj.get("type") in ("event_msg", "response_item"):
+            text = ""
+            if obj.get("type") == "event_msg" and payload.get("type") == "user_message":
+                text = _text_from_content(payload.get("message") or payload.get("text_elements"))
+            elif obj.get("type") == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
+                text = _text_from_content(payload.get("content"))
+            if text and "## My request for Codex:" in text:
+                before = text.split("## My request for Codex:", 1)[0]
+                for name, path in _extract_mentioned_files(before):
+                    add(path, "mentioned_file", name)
         if obj.get("type") == "event_msg" and payload.get("type") == "user_message":
             add(payload.get("local_images"), "local_image")
             add(payload.get("images"), "image")
@@ -846,10 +863,33 @@ def collect_attachments(raw: list[dict[str, Any]], cwd: str) -> list[Attachment]
                 for block in payload.get("content") or []:
                     if isinstance(block, dict) and block.get("type") in ("input_image", "image", "output_image"):
                         add(block, str(block.get("type")))
-            elif ptype == "function_call" and payload.get("name") == "view_image":
-                args = _parse_arguments(payload.get("arguments"))
-                if isinstance(args, dict):
-                    add(args.get("path"), "view_image")
+    return out
+
+
+def collect_output_files(raw: list[dict[str, Any]], cwd: str) -> list[Attachment]:
+    seen: set[str] = set()
+    out: list[Attachment] = []
+
+    def add(path_text: Any, kind: str, display_name: str = "") -> None:
+        if not isinstance(path_text, str) or not path_text:
+            return
+        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", path_text):
+            return
+        p = _resolve_path(path_text, cwd)
+        key = str(p)
+        if key in seen:
+            return
+        seen.add(key)
+        exists = p.exists()
+        size = p.stat().st_size if exists and p.is_file() else 0
+        out.append(Attachment(source=str(p), kind=kind, name=display_name or p.name, exists=exists, size=size))
+
+    for obj in raw:
+        payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+        if obj.get("type") == "response_item" and payload.get("type") == "function_call" and payload.get("name") == "view_image":
+            args = _parse_arguments(payload.get("arguments"))
+            if isinstance(args, dict):
+                add(args.get("path"), "view_image")
     return out
 
 
@@ -948,23 +988,24 @@ def list_files(root: Path) -> list[Path]:
     return sorted(out)
 
 
-def copy_attachments(attachments: list[Attachment], target: Path) -> list[Attachment]:
+def copy_attachments(attachments: list[Attachment], target: Path, folder: str) -> list[Attachment]:
     used: dict[str, int] = {}
     copied: list[Attachment] = []
     for att in attachments:
-        item = Attachment(source=att.source, kind=att.kind, exists=att.exists, size=att.size)
+        item = Attachment(source=att.source, kind=att.kind, name=att.name, exists=att.exists, size=att.size)
         if not att.exists:
             copied.append(item)
             continue
         src = Path(att.source)
-        name = src.name or "attachment"
+        name = att.name or src.name or "file"
+        name = Path(name).name
         count = used.get(name, 0)
         used[name] = count + 1
         if count:
             stem = src.stem or "attachment"
             suffix = src.suffix
             name = f"{stem}-{count + 1}{suffix}"
-        dest = target / "attachments" / name
+        dest = target / folder / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.copy2(src, dest)
@@ -979,7 +1020,7 @@ def copy_touched_files(files: list[TouchedFile], target: Path) -> list[TouchedFi
     out: list[TouchedFile] = []
     for tf in files:
         item = TouchedFile(**tf.__dict__)
-        dest = target / "assets" / tf.relative_path
+        dest = target / "outputs" / tf.relative_path
         dest.parent.mkdir(parents=True, exist_ok=True)
         copied = False
         src = Path(tf.absolute_path)
@@ -1005,12 +1046,77 @@ def _href(path: str) -> str:
     return "/".join(quote(part) for part in Path(path).parts)
 
 
+def _bundle_reference_map(
+    inputs: list[Attachment],
+    output_refs: list[Attachment],
+    files: list[TouchedFile],
+) -> dict[str, str]:
+    refs: dict[str, str] = {}
+    for att in inputs + output_refs:
+        if att.source and att.bundle_path:
+            refs[att.source] = att.bundle_path
+    for f in files:
+        if f.absolute_path and f.bundle_path:
+            refs[f.absolute_path] = f.bundle_path
+    return refs
+
+
+def _rewrite_bundle_file_links(text: str, refs: dict[str, str]) -> str:
+    if not text or not refs:
+        return text
+    out = text
+    for source, bundle_path in sorted(refs.items(), key=lambda item: len(item[0]), reverse=True):
+        href = _href(bundle_path)
+        label = Path(bundle_path).name or bundle_path
+        link = f"[{label}]({href})"
+        target_variants = {
+            source,
+            quote(source),
+            quote(source, safe="/:"),
+            source.replace(" ", "%20"),
+        }
+        for target in sorted(target_variants, key=len, reverse=True):
+            out = out.replace(f"]({target})", f"]({href})")
+            out = out.replace(f"](<{target}>)", f"]({href})")
+        out = out.replace(f"`{source}`", link)
+        out = out.replace(source, link)
+    return out
+
+
+def _blocks_for_render(
+    blocks: list[FlatBlock],
+    inputs: list[Attachment],
+    output_refs: list[Attachment],
+    files: list[TouchedFile],
+) -> list[FlatBlock]:
+    refs = _bundle_reference_map(inputs, output_refs, files)
+    if not refs:
+        return blocks
+    rendered: list[FlatBlock] = []
+    for b in blocks:
+        if b.kind in ("text", "reasoning") and b.role in ("user", "assistant"):
+            rendered.append(replace(b, text=_rewrite_bundle_file_links(b.text, refs)))
+        else:
+            rendered.append(b)
+    return rendered
+
+
+def _attachment_label(att: Attachment) -> str:
+    if att.bundle_path:
+        return Path(att.bundle_path).name
+    if att.name:
+        return att.name
+    return Path(att.source).name or att.source
+
+
 def render_markdown(
     meta: CodexSession,
     blocks: list[FlatBlock],
-    attachments: list[Attachment],
+    inputs: list[Attachment],
+    output_refs: list[Attachment],
     files: list[TouchedFile],
 ) -> str:
+    blocks = _blocks_for_render(blocks, inputs, output_refs, files)
     title = meta.display_title
     out: list[str] = [f"# {title}", ""]
     fields = [
@@ -1033,22 +1139,28 @@ def render_markdown(
             out.append(f"- **{label}:** `{value}`" if mono else f"- **{label}:** {value}")
     out.append("")
 
-    if attachments:
-        out += [f"## Attachments ({len(attachments)})", ""]
-        for att in attachments:
-            label = att.bundle_path or att.source
+    if inputs:
+        out += [f"## Inputs ({len(inputs)})", ""]
+        for att in inputs:
             if att.bundle_path:
-                out.append(f"- [{Path(label).name}]({label}) - {att.kind}, {_human_size(att.size)}")
+                out.append(f"- [{_attachment_label(att)}]({_href(att.bundle_path)}) - {att.kind}, {_human_size(att.size)}")
             else:
                 suffix = "missing/local unavailable" if not att.exists else _human_size(att.size)
                 out.append(f"- `{att.source}` - {att.kind}, {suffix}")
         out.append("")
 
-    if files:
-        out += [f"## Files Snapshot ({len(files)})", ""]
+    n_outputs = len(output_refs) + len(files)
+    if n_outputs:
+        out += [f"## Outputs ({n_outputs})", ""]
+        for att in output_refs:
+            if att.bundle_path:
+                out.append(f"- [{_attachment_label(att)}]({_href(att.bundle_path)}) - {att.kind}, {_human_size(att.size)}")
+            else:
+                suffix = "missing/local unavailable" if not att.exists else _human_size(att.size)
+                out.append(f"- `{att.source}` - {att.kind}, {suffix}")
         for f in files:
             if f.bundle_path:
-                out.append(f"- `{f.op}` - [{f.relative_path}]({f.bundle_path})")
+                out.append(f"- `{f.op}` - [{f.relative_path}]({_href(f.bundle_path)})")
             else:
                 status = "not readable" if f.edit_only else "missing"
                 out.append(f"- `{f.op}` - `{f.absolute_path}` ({status})")
@@ -1304,9 +1416,11 @@ $messages
 def render_html(
     meta: CodexSession,
     blocks: list[FlatBlock],
-    attachments: list[Attachment],
+    inputs: list[Attachment],
+    output_refs: list[Attachment],
     files: list[TouchedFile],
 ) -> str:
+    blocks = _blocks_for_render(blocks, inputs, output_refs, files)
     esc = html_mod.escape
     title = meta.display_title
     rows = [
@@ -1331,30 +1445,40 @@ def render_html(
             head.append(f"<dt>{esc(label)}</dt><dd{cls}>{esc(value)}</dd>")
     head.append("</dl></header>")
 
-    attachments_html = ""
-    if attachments:
+    inputs_html = ""
+    if inputs:
         items = []
-        for att in attachments:
+        for att in inputs:
             if att.bundle_path:
                 items.append(
-                    f"<li><a href='{esc(_href(att.bundle_path), quote=True)}'>{esc(Path(att.bundle_path).name)}</a>"
+                    f"<li><a href='{esc(_href(att.bundle_path), quote=True)}'>{esc(_attachment_label(att))}</a>"
                     f" <span class='mono'>{esc(att.kind)}</span> <span>{esc(_human_size(att.size))}</span></li>"
                 )
             else:
                 status = "missing/local unavailable" if not att.exists else _human_size(att.size)
                 items.append(f"<li><span class='mono'>{esc(att.source)}</span> {esc(att.kind)} {esc(status)}</li>")
-        attachments_html = f"<section class='section'><h2>Attachments ({len(attachments)})</h2><ul>{''.join(items)}</ul></section>"
+        inputs_html = f"<section class='section'><h2>Inputs ({len(inputs)})</h2><ul>{''.join(items)}</ul></section>"
 
-    files_html = ""
-    if files:
+    outputs_html = ""
+    n_outputs = len(output_refs) + len(files)
+    if n_outputs:
         items = []
+        for att in output_refs:
+            if att.bundle_path:
+                items.append(
+                    f"<li><a href='{esc(_href(att.bundle_path), quote=True)}'>{esc(_attachment_label(att))}</a>"
+                    f" <span class='mono'>{esc(att.kind)}</span> <span>{esc(_human_size(att.size))}</span></li>"
+                )
+            else:
+                status = "missing/local unavailable" if not att.exists else _human_size(att.size)
+                items.append(f"<li><span class='mono'>{esc(att.source)}</span> {esc(att.kind)} {esc(status)}</li>")
         for f in files:
             if f.bundle_path:
                 link = f"<a href='{esc(_href(f.bundle_path), quote=True)}'>{esc(f.relative_path)}</a>"
             else:
                 link = f"<span class='mono'>{esc(f.absolute_path)}</span>"
             items.append(f"<li><span class='mono'>{esc(f.op)}</span> {link}</li>")
-        files_html = f"<section class='section'><h2>Files Snapshot ({len(files)})</h2><ul>{''.join(items)}</ul></section>"
+        outputs_html = f"<section class='section'><h2>Outputs ({n_outputs})</h2><ul>{''.join(items)}</ul></section>"
 
     preamble, exchanges = _split_exchanges(blocks)
     toc = ""
@@ -1362,7 +1486,7 @@ def render_html(
     if user_blocks:
         items = []
         for i, u in enumerate(user_blocks):
-            preview = _preview(u.text, 90) or "(empty)"
+            preview = _preview_plain(u.text, 90) or "(empty)"
             items.append(f"<li><a href='#u{i}'>{esc(preview)}</a></li>")
         toc = f"<nav class='toc'><h2>User prompts</h2><ol>{''.join(items)}</ol></nav>"
 
@@ -1381,7 +1505,7 @@ def render_html(
         parts.append(f"<section class='exchange' id='e{ex_i}'>")
         parts.append("<div class='prompt-group'>")
         for user in users:
-            preview = _preview(user.text, 120) or "(empty)"
+            preview = _preview_plain(user.text, 120) or "(empty)"
             ts = esc(_fmt_ts(user.timestamp))
             parts.append(f"<section class='turn prompt-turn' id='u{user_i}'>")
             parts.append(
@@ -1443,8 +1567,8 @@ def render_html(
     return HTML_TEMPLATE.substitute(
         title=esc(title),
         header="".join(head),
-        attachments=attachments_html,
-        files=files_html,
+        attachments=inputs_html,
+        files=outputs_html,
         toc=toc,
         messages="".join(parts),
     )
@@ -1531,13 +1655,17 @@ def _render_block_html(block: FlatBlock) -> str:
 def render_json(
     meta: CodexSession,
     blocks: list[FlatBlock],
-    attachments: list[Attachment],
+    inputs: list[Attachment],
+    output_refs: list[Attachment],
     files: list[TouchedFile],
 ) -> str:
+    outputs = [a.to_dict() for a in output_refs] + [f.to_dict() for f in files]
     payload = {
         "meta": meta.to_dict(),
-        "attachments": [a.to_dict() for a in attachments],
-        "files": [f.to_dict() for f in files],
+        "inputs": [a.to_dict() for a in inputs],
+        "outputs": outputs,
+        "attachments": [a.to_dict() for a in inputs],
+        "files": outputs,
         "messages": [b.to_dict() for b in blocks],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -1600,28 +1728,37 @@ def export_one(
         display_user_inputs=True,
     )
     archive_blocks = flatten(raw, include_context=True, include_reasoning=True)
-    attachments = collect_attachments(raw, meta.cwd) if include_files else []
+    inputs = collect_input_files(raw, meta.cwd) if include_files else []
+    output_refs = collect_output_files(raw, meta.cwd) if include_files else []
     touched = collect_touched_files(archive_blocks, meta.cwd) if include_files else []
 
     target = output_root / meta.session_id
     target.mkdir(parents=True, exist_ok=True)
+    for folder in ("inputs", "outputs", "attachments", "assets"):
+        stale = target / folder
+        if stale.exists():
+            if stale.is_dir():
+                shutil.rmtree(stale)
+            else:
+                stale.unlink()
     shutil.copy2(meta.transcript_path, target / "transcript.jsonl")
 
     (target / "metadata.json").write_text(json.dumps(meta.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-    copied_attachments = copy_attachments(attachments, target) if include_files else []
+    copied_inputs = copy_attachments(inputs, target, "inputs") if include_files else []
+    copied_output_refs = copy_attachments(output_refs, target, "outputs") if include_files else []
     copied_files = copy_touched_files(touched, target) if include_files else []
 
     formats = list(formats)
     if "html" in formats:
-        (target / "session.html").write_text(render_html(meta, display_blocks, copied_attachments, copied_files), encoding="utf-8")
+        (target / "session.html").write_text(render_html(meta, display_blocks, copied_inputs, copied_output_refs, copied_files), encoding="utf-8")
     if "md" in formats:
-        (target / "session.md").write_text(render_markdown(meta, display_blocks, copied_attachments, copied_files), encoding="utf-8")
+        (target / "session.md").write_text(render_markdown(meta, display_blocks, copied_inputs, copied_output_refs, copied_files), encoding="utf-8")
     if "json" in formats:
-        (target / "session.json").write_text(render_json(meta, archive_blocks, copied_attachments, copied_files), encoding="utf-8")
+        (target / "session.json").write_text(render_json(meta, archive_blocks, copied_inputs, copied_output_refs, copied_files), encoding="utf-8")
     if "csv" in formats:
         write_csv(target / "session.csv", archive_blocks)
 
-    _write_bundle_readme(target, meta, display_blocks, archive_blocks, copied_attachments, copied_files, formats)
+    _write_bundle_readme(target, meta, display_blocks, archive_blocks, copied_inputs, copied_output_refs, copied_files, formats)
     return target
 
 
@@ -1630,7 +1767,8 @@ def _write_bundle_readme(
     meta: CodexSession,
     display_blocks: list[FlatBlock],
     archive_blocks: list[FlatBlock],
-    attachments: list[Attachment],
+    inputs: list[Attachment],
+    output_refs: list[Attachment],
     files: list[TouchedFile],
     formats: list[str],
 ) -> None:
@@ -1649,10 +1787,11 @@ def _write_bundle_readme(
         f"- Archived blocks: {len(archive_blocks)}",
     ]
     lines = [line for line in lines if line]
-    if attachments:
-        lines.append(f"- Attachments: {len(attachments)}")
-    if files:
-        lines.append(f"- File snapshots: {len(files)}")
+    if inputs:
+        lines.append(f"- Inputs: {len(inputs)}")
+    n_outputs = len(output_refs) + len(files)
+    if n_outputs:
+        lines.append(f"- Outputs: {n_outputs}")
     lines += ["", "## Files in this bundle", ""]
     if "html" in formats:
         lines.append("- `session.html` - formatted browser view")
@@ -1664,10 +1803,10 @@ def _write_bundle_readme(
         lines.append("- `session.csv` - flat per-block table")
     lines.append("- `metadata.json` - extracted Codex session metadata")
     lines.append("- `transcript.jsonl` - raw Codex JSONL transcript")
-    if attachments:
-        lines.append("- `attachments/` - local images or other referenced attachments that were readable")
-    if files:
-        lines.append("- `assets/` - files inferred from edit tool calls")
+    if inputs:
+        lines.append("- `inputs/` - readable user-provided or user-mentioned files")
+    if n_outputs:
+        lines.append("- `outputs/` - readable generated, viewed, written, or edited files")
     (target / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1782,7 +1921,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=",".join(SUPPORTED_FORMATS),
         help=f"comma-separated subset of {','.join(SUPPORTED_FORMATS)} (default: all)",
     )
-    pe.add_argument("--no-files", action="store_true", help="skip copying attachments and inferred file snapshots")
+    pe.add_argument("--no-files", action="store_true", help="skip copying input/output files")
     pe.add_argument("--include-context", action="store_true", help="include developer/system context blocks in rendered exports")
     pe.add_argument(
         "--include-reasoning",

@@ -21,6 +21,7 @@ import html as html_mod
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 import textwrap
@@ -36,7 +37,13 @@ HOME = Path.home()
 
 
 def _expand_path(value: Any) -> Path:
-    return Path(os.path.expandvars(str(value))).expanduser()
+    text = str(value)
+    text = re.sub(
+        r"\$env:([A-Za-z_][A-Za-z0-9_]*)",
+        lambda m: os.environ.get(m.group(1), m.group(0)),
+        text,
+    )
+    return Path(os.path.expandvars(text)).expanduser()
 
 
 def _codex_home_candidates() -> list[Path]:
@@ -840,6 +847,167 @@ def _clean_rel(path: Path) -> str:
     return "/".join(parts)
 
 
+OUTPUT_NEXT_OPTIONS = {
+    "-o",
+    "-O",
+    "--output",
+    "--out",
+    "--outfile",
+    "--out-file",
+    "--output-file",
+    "--save",
+    "--save-as",
+    "-outfile",
+    "-outputfile",
+    "-destination",
+    "-outpath",
+}
+OUTPUT_ASSIGN_OPTIONS = {
+    "--output",
+    "--out",
+    "--outfile",
+    "--out-file",
+    "--output-file",
+    "--save",
+    "--save-as",
+    "-outfile",
+    "-outputfile",
+    "-destination",
+    "-outpath",
+}
+OUTPUT_CMDLETS = {
+    "out-file",
+    "set-content",
+    "add-content",
+    "export-csv",
+    "export-clixml",
+    "start-transcript",
+    "tee-object",
+}
+COPY_DEST_COMMANDS = {"cp", "copy", "copy-item", "mv", "move", "move-item"}
+OUTPUT_VALUE_KEYS = {
+    "output",
+    "out",
+    "outfile",
+    "out_file",
+    "output_file",
+    "output_path",
+    "save_path",
+    "destination",
+    "dest",
+    "target_path",
+}
+OUTPUT_METHOD_RES = [
+    re.compile(r"Path\(\s*[rRbBuUfF]*(['\"])(.+?)\1\s*\)\.write_(?:text|bytes)\("),
+    re.compile(r"open\(\s*[rRbBuUfF]*(['\"])(.+?)\1\s*,\s*['\"][^'\"]*[wax+][^'\"]*['\"]"),
+    re.compile(r"\.(?:to_csv|to_excel|savefig|save)\(\s*[rRbBuUfF]*(['\"])(.+?)\1"),
+]
+
+
+def _strip_shell_token(value: str) -> str:
+    text = (value or "").strip()
+    while text and text[0] in ("'", '"', "`"):
+        text = text[1:]
+    while text and text[-1] in ("'", '"', "`", ";"):
+        text = text[:-1]
+    return text.strip()
+
+
+def _is_dash_option(value: str) -> bool:
+    return value.startswith("-") and not _is_windows_drive_path(value)
+
+
+def _is_plausible_output_path(value: str) -> bool:
+    text = _strip_shell_token(value)
+    if not text or text in {"-", "/dev/null", "NUL", "nul", "$null"}:
+        return False
+    if text in {"|", ">", ">>", "2>", "2>>", "*>", "&>", "&&", "||"}:
+        return False
+    if _is_dash_option(text):
+        return False
+    if _is_external_uri(text):
+        return False
+    return True
+
+
+def _shell_tokens(cmd: str) -> list[str]:
+    cmd = re.sub(r"([;|])", r" \1 ", cmd)
+    try:
+        raw = shlex.split(cmd, posix=False)
+    except ValueError:
+        raw = re.findall(r'"[^"]+"|\'[^\']+\'|\S+', cmd)
+    out: list[str] = []
+    for token in raw:
+        if token in {";", "|", "&&", "||"}:
+            out.append(token)
+        else:
+            out.append(_strip_shell_token(token))
+    return out
+
+
+def _extract_shell_output_paths(cmd: str) -> list[str]:
+    paths: list[str] = []
+
+    def add(value: str) -> None:
+        value = _strip_shell_token(value)
+        if _is_plausible_output_path(value) and value not in paths:
+            paths.append(value)
+
+    # Shell and PowerShell redirections.
+    for m in re.finditer(r"(?:^|[\s;|&])(?:\d?>|\d?>>|\*>|&>|>>|>)\s*(?![>&])(\"[^\"]+\"|'[^']+'|[^\s;&|]+)", cmd):
+        add(m.group(1))
+
+    # Common Python/R/plotting/dataframe write patterns inside heredocs.
+    for pattern in OUTPUT_METHOD_RES:
+        for m in pattern.finditer(cmd):
+            add(m.group(2))
+
+    tokens = _shell_tokens(cmd)
+    lower = [t.lower() for t in tokens]
+    for i, token in enumerate(tokens):
+        low = lower[i]
+        if "=" in token:
+            key, value = token.split("=", 1)
+            if key.lower() in OUTPUT_ASSIGN_OPTIONS:
+                add(value)
+            continue
+        if low in {opt.lower() for opt in OUTPUT_NEXT_OPTIONS} and i + 1 < len(tokens):
+            add(tokens[i + 1])
+        if low in COPY_DEST_COMMANDS and i + 1 < len(tokens):
+            rest: list[str] = []
+            for t in tokens[i + 1:]:
+                if t in {";", "|", "&&", "||"}:
+                    break
+                rest.append(t)
+            positional = [t for t in rest if t and not _is_dash_option(t)]
+            if len(positional) >= 2:
+                add(positional[-1])
+        if low in OUTPUT_CMDLETS and i + 1 < len(tokens):
+            for j in range(i + 1, len(tokens)):
+                if lower[j] in {"-filepath", "-path", "-literalpath"} and j + 1 < len(tokens):
+                    add(tokens[j + 1])
+                    break
+                if tokens[j] in {";", "|", "&&", "||"}:
+                    break
+                if not _is_dash_option(tokens[j]):
+                    add(tokens[j])
+                    break
+    return paths
+
+
+def _iter_output_value_paths(value: Any, parent_key: str = "") -> Iterable[str]:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_l = str(key).lower().replace("-", "_")
+            if isinstance(item, str) and key_l in OUTPUT_VALUE_KEYS and _is_plausible_output_path(item):
+                yield item
+            elif isinstance(item, (dict, list, tuple)):
+                yield from _iter_output_value_paths(item, key_l)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_output_value_paths(item, parent_key)
+
+
 def collect_input_files(raw: list[dict[str, Any]], cwd: str) -> list[Attachment]:
     seen: set[str] = set()
     out: list[Attachment] = []
@@ -908,16 +1076,20 @@ def collect_output_files(raw: list[dict[str, Any]], cwd: str) -> list[Attachment
         if key in seen:
             return
         seen.add(key)
-        exists = p.exists()
-        size = p.stat().st_size if exists and p.is_file() else 0
+        exists = p.exists() and p.is_file()
+        size = p.stat().st_size if exists else 0
         out.append(Attachment(source=str(p), kind=kind, name=display_name or p.name, exists=exists, size=size))
 
     for obj in raw:
         payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
-        if obj.get("type") == "response_item" and payload.get("type") == "function_call" and payload.get("name") == "view_image":
+        if obj.get("type") == "response_item" and payload.get("type") == "function_call":
+            tool_name = str(payload.get("name") or "")
             args = _parse_arguments(payload.get("arguments"))
-            if isinstance(args, dict):
+            if tool_name == "view_image" and isinstance(args, dict):
                 add(args.get("path"), "view_image")
+            elif isinstance(args, dict):
+                for path_text in _iter_output_value_paths(args):
+                    add(path_text, f"{tool_name}_output")
     return out
 
 
@@ -928,6 +1100,8 @@ def collect_touched_files(blocks: list[FlatBlock], cwd: str) -> list[TouchedFile
         if not path_text:
             return
         p = _resolve_path(path_text, base or cwd)
+        if op == "shell-output" and p.exists() and not p.is_file():
+            return
         rel = _bundle_rel_for_path(p, cwd)
         exists = p.exists()
         size = p.stat().st_size if exists and p.is_file() else 0
@@ -959,6 +1133,8 @@ def collect_touched_files(blocks: list[FlatBlock], cwd: str) -> list[TouchedFile
             if "*** Begin Patch" in cmd:
                 for item in _parse_patch_touched(cmd):
                     add(item["path"], item["op"], tool, block.call_id, workdir, item.get("content"), item.get("edit_only", False))
+            for path_text in _extract_shell_output_paths(cmd):
+                add(path_text, "shell-output", tool, block.call_id, workdir)
         elif tool in ("write_file", "create_file", "str_replace_editor"):
             if isinstance(args, dict):
                 path_text = str(args.get("path") or args.get("file_path") or args.get("target_file") or "")
@@ -1053,6 +1229,8 @@ def copy_attachments(attachments: list[Attachment], target: Path, folder: str) -
 
 
 def copy_touched_files(files: list[TouchedFile], target: Path) -> list[TouchedFile]:
+    if files:
+        (target / "outputs").mkdir(parents=True, exist_ok=True)
     out: list[TouchedFile] = []
     for tf in files:
         item = TouchedFile(**tf.__dict__)
@@ -1076,6 +1254,15 @@ def copy_touched_files(files: list[TouchedFile], target: Path) -> list[TouchedFi
             item.bundle_path = str(dest.relative_to(target))
         out.append(item)
     return out
+
+
+def write_outputs_manifest(target: Path, output_refs: list[Attachment], files: list[TouchedFile]) -> None:
+    if not output_refs and not files:
+        return
+    folder = target / "outputs"
+    folder.mkdir(parents=True, exist_ok=True)
+    payload = [a.to_dict() for a in output_refs] + [f.to_dict() for f in files]
+    (folder / "_manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _href(path: str) -> str:
@@ -1783,6 +1970,8 @@ def export_one(
     copied_inputs = copy_attachments(inputs, target, "inputs") if include_files else []
     copied_output_refs = copy_attachments(output_refs, target, "outputs") if include_files else []
     copied_files = copy_touched_files(touched, target) if include_files else []
+    if include_files:
+        write_outputs_manifest(target, copied_output_refs, copied_files)
 
     formats = list(formats)
     if "html" in formats:

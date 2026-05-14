@@ -20,7 +20,9 @@ This tool flattens a session into:
   assistant commentary, and a light/dark theme toggle.
 - `session.md` - GitHub-flavored Markdown reading export.
 - `session.json` - structured per-block archival dump for another LLM or script.
-- `session.csv` - flat archival per-block table for spreadsheets or ingestion.
+- `session.csv` - flat archival per-block table for spreadsheets or ingestion;
+  very large cells are capped with length/truncation columns, with full text in
+  `session.json` and `transcript.jsonl`.
 - `metadata.json` - extracted session metadata.
 - `transcript.jsonl` - the lossless raw Codex source.
 - `attachments/` and `assets/` - readable local images and files inferred from

@@ -90,6 +90,7 @@ SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
 DEFAULT_OUTPUT = Path.cwd() / "exports"
 SUPPORTED_FORMATS = ("html", "md", "json", "csv")
 TOOL_RESULT_TRUNCATE = 8000
+CSV_CELL_MAX_CHARS = 32000
 INTERNAL_ROLES = {"developer", "system"}
 
 
@@ -308,6 +309,15 @@ def _extract_mentioned_files(text: str) -> list[tuple[str, str]]:
 
 def _safe_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2)
+
+
+def _csv_cell(value: str, limit: int = CSV_CELL_MAX_CHARS) -> tuple[str, int, bool]:
+    value = value or ""
+    if len(value) <= limit:
+        return value, len(value), False
+    suffix = "\n...[truncated; full content in session.json and transcript.jsonl]"
+    keep = max(0, limit - len(suffix))
+    return value[:keep] + suffix, len(value), True
 
 
 def _parse_arguments(value: Any) -> Any:
@@ -1536,7 +1546,9 @@ def render_json(
 def write_csv(path: Path, blocks: list[FlatBlock]) -> None:
     cols = [
         "index", "timestamp", "role", "phase", "kind",
-        "tool_name", "call_id", "is_error", "preview", "content", "tool_input_json",
+        "tool_name", "call_id", "is_error", "preview",
+        "content", "content_chars", "content_truncated",
+        "tool_input_json", "tool_input_json_chars", "tool_input_json_truncated",
     ]
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
@@ -1546,6 +1558,9 @@ def write_csv(path: Path, blocks: list[FlatBlock]) -> None:
                 content = _safe_json(b.tool_input)
             else:
                 content = b.text
+            content_cell, content_chars, content_truncated = _csv_cell(content)
+            tool_input_json = json.dumps(b.tool_input, ensure_ascii=False) if b.tool_input is not None else ""
+            tool_input_cell, tool_input_chars, tool_input_truncated = _csv_cell(tool_input_json)
             writer.writerow([
                 b.index,
                 b.timestamp,
@@ -1556,8 +1571,12 @@ def write_csv(path: Path, blocks: list[FlatBlock]) -> None:
                 b.call_id,
                 "1" if b.is_error else "",
                 _preview(content, 200),
-                content,
-                json.dumps(b.tool_input, ensure_ascii=False) if b.tool_input is not None else "",
+                content_cell,
+                content_chars,
+                "1" if content_truncated else "",
+                tool_input_cell,
+                tool_input_chars,
+                "1" if tool_input_truncated else "",
             ])
 
 

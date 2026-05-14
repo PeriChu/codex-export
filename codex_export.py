@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from string import Template
 from typing import Any, Iterable, Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 
 
 HOME = Path.home()
@@ -778,8 +778,36 @@ def _looks_like_error(text: str) -> bool:
     return any(re.search(p, lower, flags=re.IGNORECASE) for p in patterns)
 
 
+def _is_windows_drive_path(value: str) -> bool:
+    return bool(re.match(r"^[a-zA-Z]:", value or ""))
+
+
+def _is_external_uri(value: str) -> bool:
+    m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*):", value or "")
+    if not m:
+        return False
+    scheme = m.group(1).lower()
+    if len(scheme) == 1 and _is_windows_drive_path(value):
+        return False
+    return scheme != "file"
+
+
+def _local_path_text(path_text: str) -> str:
+    if not path_text.lower().startswith("file:"):
+        return path_text
+    parsed = urlparse(path_text)
+    path = unquote(parsed.path or "")
+    if parsed.netloc and parsed.netloc.lower() != "localhost":
+        path = f"//{parsed.netloc}{path}"
+    if re.match(r"^/[a-zA-Z]:", path):
+        path = path[1:]
+    if sys.platform == "win32":
+        path = path.replace("/", "\\")
+    return path
+
+
 def _resolve_path(path_text: str, base: str = "") -> Path:
-    p = _expand_path(path_text)
+    p = _expand_path(_local_path_text(path_text))
     if not p.is_absolute():
         p = (_expand_path(base) if base else Path.cwd()) / p
     try:
@@ -834,7 +862,7 @@ def collect_input_files(raw: list[dict[str, Any]], cwd: str) -> list[Attachment]
             if not raw_path or raw_path in seen:
                 continue
             seen.add(raw_path)
-            if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", raw_path):
+            if _is_external_uri(raw_path):
                 out.append(Attachment(source=raw_path, kind=kind, name=name, exists=False))
                 continue
             p = _resolve_path(raw_path, cwd)
@@ -873,7 +901,7 @@ def collect_output_files(raw: list[dict[str, Any]], cwd: str) -> list[Attachment
     def add(path_text: Any, kind: str, display_name: str = "") -> None:
         if not isinstance(path_text, str) or not path_text:
             return
-        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", path_text):
+        if _is_external_uri(path_text):
             return
         p = _resolve_path(path_text, cwd)
         key = str(p)
@@ -989,6 +1017,8 @@ def list_files(root: Path) -> list[Path]:
 
 
 def copy_attachments(attachments: list[Attachment], target: Path, folder: str) -> list[Attachment]:
+    if attachments:
+        (target / folder).mkdir(parents=True, exist_ok=True)
     used: dict[str, int] = {}
     copied: list[Attachment] = []
     for att in attachments:
@@ -1013,6 +1043,12 @@ def copy_attachments(attachments: list[Attachment], target: Path, folder: str) -
         except OSError:
             pass
         copied.append(item)
+    if attachments:
+        manifest = target / folder / "_manifest.json"
+        manifest.write_text(
+            json.dumps([item.to_dict() for item in copied], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     return copied
 
 

@@ -27,6 +27,8 @@ This tool flattens a session into:
 - `transcript.jsonl` - the lossless raw Codex source.
 - `inputs/` and `outputs/` - readable files mentioned by the user, local image
   inputs, viewed/generated files, and files inferred from edit tool calls.
+  Each folder includes `_manifest.json` so missing or unreadable references are
+  still visible.
 
 ## Install
 

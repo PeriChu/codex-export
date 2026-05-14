@@ -106,7 +106,7 @@ codex-export list
 codex-export export latest
 
 # export by session-id prefix
-codex-export export 019e264d --output ./exports
+codex-export export <session-id> --output ./exports
 
 # export every session
 codex-export export all --output ./exports

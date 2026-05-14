@@ -26,7 +26,9 @@ This tool flattens a session into:
 - `metadata.json` - extracted session metadata.
 - `transcript.jsonl` - the lossless raw Codex source.
 - `inputs/` and `outputs/` - readable files mentioned by the user, local image
-  inputs, viewed/generated files, and files inferred from edit tool calls.
+  inputs, viewed/generated files, files inferred from edit tool calls, and
+  common shell/PowerShell output targets such as redirection, `-o`,
+  `-OutFile`, `Out-File`, `Export-Csv`, and `Copy-Item -Destination`.
   Each folder includes `_manifest.json` so missing or unreadable references are
   still visible.
 
@@ -165,9 +167,9 @@ exports/<session-id>/
   remains the lossless source.
 - AI reasoning records are omitted from rendered HTML/Markdown by default. Use
   `--include-reasoning` to include readable reasoning summaries/content there.
-- File snapshots are inferred mainly from `apply_patch` and a few editor-style
-  tool calls. Arbitrary shell commands can create files in ways no exporter can
-  reliably infer.
+- File snapshots are inferred from editor-style tool calls and common shell
+  output patterns. Arbitrary shell scripts can still create files in ways no
+  exporter can reliably infer.
 - The rendered HTML uses `marked.js` and `highlight.js` from a CDN at runtime.
   The Markdown, JSON, CSV, metadata, and raw transcript are fully local.
 - By default, developer/system context is not shown in rendered exports because

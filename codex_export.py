@@ -111,6 +111,7 @@ class CodexSession:
     effort: str = ""
     originator: str = ""
     source: str = ""
+    thread_source: str = ""
     model_provider: str = ""
     cli_version: str = ""
     approval_policy: str = ""
@@ -423,6 +424,7 @@ def inspect_session(path: Path, index: Optional[dict[str, dict[str, str]]] = Non
     effort = ""
     originator = ""
     source = ""
+    thread_source = ""
     model_provider = ""
     cli_version = ""
     approval_policy = ""
@@ -470,6 +472,7 @@ def inspect_session(path: Path, index: Optional[dict[str, dict[str, str]]] = Non
                 cwd = str(payload.get("cwd") or cwd)
                 originator = str(payload.get("originator") or originator)
                 source = str(payload.get("source") or source)
+                thread_source = str(payload.get("thread_source") or thread_source)
                 model_provider = str(payload.get("model_provider") or model_provider)
                 cli_version = str(payload.get("cli_version") or cli_version)
                 continue
@@ -513,6 +516,7 @@ def inspect_session(path: Path, index: Optional[dict[str, dict[str, str]]] = Non
         effort=effort,
         originator=originator,
         source=source,
+        thread_source=thread_source,
         model_provider=model_provider,
         cli_version=cli_version,
         approval_policy=approval_policy,
@@ -529,12 +533,26 @@ def inspect_session(path: Path, index: Optional[dict[str, dict[str, str]]] = Non
 def discover_sessions(
     sessions_root: Path = SESSIONS_ROOT,
     index_path: Path = SESSION_INDEX,
+    include_subagents: bool = False,
 ) -> list[CodexSession]:
     index = _read_index(index_path)
     if not sessions_root.exists():
         return []
     files = sorted(sessions_root.glob("*/*/*/*.jsonl"))
     sessions = [inspect_session(p, index) for p in files]
+    if not include_subagents:
+        sessions = [s for s in sessions if s.thread_source != "subagent"]
+    by_id: dict[str, CodexSession] = {}
+    for session in sessions:
+        current = by_id.get(session.session_id)
+        if current is None:
+            by_id[session.session_id] = session
+            continue
+        old_key = (_sort_key(current.updated_at or current.started_at), current.file_size)
+        new_key = (_sort_key(session.updated_at or session.started_at), session.file_size)
+        if new_key >= old_key:
+            by_id[session.session_id] = session
+    sessions = list(by_id.values())
     sessions.sort(key=lambda s: _sort_key(s.updated_at or s.started_at), reverse=True)
     return sessions
 
@@ -1347,6 +1365,7 @@ def render_markdown(
         ("Source", "Codex", False),
         ("Originator", meta.originator, False),
         ("Codex source", meta.source, False),
+        ("Thread source", meta.thread_source, False),
         ("Model", meta.model, False),
         ("Effort", meta.effort, False),
         ("Working dir", meta.cwd, True),
@@ -1651,6 +1670,7 @@ def render_html(
         ("Source", "Codex", False),
         ("Originator", meta.originator, False),
         ("Codex source", meta.source, False),
+        ("Thread source", meta.thread_source, False),
         ("Model", meta.model, False),
         ("Effort", meta.effort, False),
         ("Working dir", meta.cwd, True),
@@ -2008,6 +2028,7 @@ def _write_bundle_readme(
         f"- Updated: {_fmt_ts(meta.updated_at)}",
         f"- Working dir: `{meta.cwd}`" if meta.cwd else "",
         f"- Model: {meta.model}" if meta.model else "",
+        f"- Thread source: {meta.thread_source}" if meta.thread_source else "",
         f"- Rendered blocks: {len(display_blocks)} ({n_user} user, {n_asst} assistant, {n_tools} tool calls)",
         f"- Archived blocks: {len(archive_blocks)}",
     ]
@@ -2039,7 +2060,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     codex_home = _expand_path(args.codex_home)
     root = _expand_path(args.sessions_root).resolve() if args.sessions_root else (codex_home / "sessions").resolve()
     index = _expand_path(args.index).resolve() if args.index else (codex_home / "session_index.jsonl").resolve()
-    sessions = discover_sessions(root, index)
+    sessions = discover_sessions(root, index, include_subagents=args.include_subagents)
     if not sessions:
         print(f"No Codex sessions found under {root}")
         return 0
@@ -2061,7 +2082,7 @@ def cmd_export(args: argparse.Namespace) -> int:
     codex_home = _expand_path(args.codex_home)
     root = _expand_path(args.sessions_root).resolve() if args.sessions_root else (codex_home / "sessions").resolve()
     index = _expand_path(args.index).resolve() if args.index else (codex_home / "session_index.jsonl").resolve()
-    sessions = discover_sessions(root, index)
+    sessions = discover_sessions(root, index, include_subagents=args.include_subagents)
     targets = resolve_sessions(args.session, sessions)
 
     if not targets:
@@ -2126,6 +2147,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="FILE",
         help="override session_index.jsonl (default: <codex-home>/session_index.jsonl)",
+    )
+    common.add_argument(
+        "--include-subagents",
+        action="store_true",
+        help="include subagent/background rollout sessions that are hidden from the Codex app sidebar by default",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", parents=[common], help="list available Codex sessions").set_defaults(func=cmd_list)

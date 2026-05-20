@@ -32,6 +32,11 @@ This tool flattens a session into:
   Each folder includes `_manifest.json` so missing or unreadable references are
   still visible.
 
+By default `list`, `latest`, and `all` match the Codex app sidebar: subagent and
+background rollout sessions are hidden, and duplicate rollout files are
+de-duplicated by session id. Use `--include-subagents` when you want hidden
+internal sessions for debugging.
+
 ## Install
 
 Recommended install uses `pipx`, so the `codex-export` command is available
@@ -115,6 +120,9 @@ codex-export export <session-id> --output ./exports
 # export every session
 codex-export export all --output ./exports
 
+# include hidden subagent/background rollouts when debugging
+codex-export list --include-subagents
+
 # choose formats
 codex-export export latest --formats html,json
 
@@ -165,6 +173,8 @@ exports/<session-id>/
 - JSON/CSV use an archival view and preserve as much of the flattened event
   stream as possible, including context/tool records. The raw `transcript.jsonl`
   remains the lossless source.
+- Subagent/background rollout sessions are hidden by default because the Codex
+  app sidebar does not show them as top-level conversations.
 - AI reasoning records are omitted from rendered HTML/Markdown by default. Use
   `--include-reasoning` to include readable reasoning summaries/content there.
 - File snapshots are inferred from editor-style tool calls and common shell

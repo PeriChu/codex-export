@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import getpass
 import html as html_mod
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
 import sys
 import textwrap
 from dataclasses import dataclass, field, replace
@@ -99,6 +101,13 @@ SUPPORTED_FORMATS = ("html", "md", "json", "csv")
 TOOL_RESULT_TRUNCATE = 8000
 CSV_CELL_MAX_CHARS = 32000
 INTERNAL_ROLES = {"developer", "system"}
+AUTH_DEFAULT_FILES = ("auth.json", "installation_id")
+AUTH_RISK_WARNING = (
+    "HIGH RISK: --include-auth copies Codex authentication material into the export bundle. "
+    "Use it only for same-account cross-device migration, protect the bundle like a password, "
+    "and delete it when finished."
+)
+AUTH_CONFIRM_PHRASE = "I UNDERSTAND"
 
 
 @dataclass
@@ -190,6 +199,19 @@ class TouchedFile:
         d = self.__dict__.copy()
         d.pop("recorded_content", None)
         return d
+
+
+@dataclass
+class AuthFile:
+    source: str
+    relative_path: str
+    bundle_path: str = ""
+    exists: bool = False
+    size: int = 0
+    selected_by: str = "default"
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.__dict__.copy()
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -865,6 +887,19 @@ def _clean_rel(path: Path) -> str:
     return "/".join(parts)
 
 
+def _safe_rel_text(value: str) -> str:
+    text = (value or "").replace("\\", "/").strip("/")
+    parts = [p for p in text.split("/") if p and p not in (".", "..")]
+    return "/".join(parts)
+
+
+def _path_under(path: Path, base: Path) -> Optional[Path]:
+    try:
+        return path.resolve(strict=False).relative_to(base.resolve(strict=False))
+    except (OSError, ValueError):
+        return None
+
+
 OUTPUT_NEXT_OPTIONS = {
     "-o",
     "-O",
@@ -1281,6 +1316,95 @@ def write_outputs_manifest(target: Path, output_refs: list[Attachment], files: l
     folder.mkdir(parents=True, exist_ok=True)
     payload = [a.to_dict() for a in output_refs] + [f.to_dict() for f in files]
     (folder / "_manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def collect_auth_files(codex_home: Path, extra_auth_files: Iterable[str]) -> list[AuthFile]:
+    base = codex_home.resolve(strict=False)
+    out: list[AuthFile] = []
+    seen: set[str] = set()
+
+    def add(rel_text: str, selected_by: str) -> None:
+        rel = _safe_rel_text(rel_text)
+        if not rel:
+            return
+        candidate = (base / rel).resolve(strict=False)
+        rel_path = _path_under(candidate, base)
+        if rel_path is None:
+            print(f"warn: ignoring auth path outside codex home: {rel_text}", file=sys.stderr)
+            return
+        rel_clean = _clean_rel(rel_path)
+        if rel_clean in seen:
+            return
+        seen.add(rel_clean)
+        exists = candidate.exists() and candidate.is_file()
+        size = candidate.stat().st_size if exists else 0
+        out.append(
+            AuthFile(
+                source=str(candidate),
+                relative_path=rel_clean,
+                exists=exists,
+                size=size,
+                selected_by=selected_by,
+            )
+        )
+
+    for name in AUTH_DEFAULT_FILES:
+        add(name, "default")
+    for name in extra_auth_files:
+        add(name, "extra")
+    return out
+
+
+def build_auth_origin(codex_home: Path) -> dict[str, Any]:
+    return {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "source_codex_home": str(codex_home.resolve(strict=False)),
+        "platform": sys.platform,
+        "hostname": socket.gethostname(),
+        "username": getpass.getuser(),
+    }
+
+
+def copy_auth_files(files: list[AuthFile], target: Path, origin: Optional[dict[str, Any]] = None) -> list[AuthFile]:
+    copied: list[AuthFile] = []
+    folder = target / "auth"
+    if files:
+        folder.mkdir(parents=True, exist_ok=True)
+    for item in files:
+        next_item = AuthFile(**item.__dict__)
+        if item.exists:
+            src = Path(item.source)
+            dest = folder / item.relative_path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(src, dest)
+                next_item.bundle_path = str(dest.relative_to(target))
+            except OSError:
+                pass
+        copied.append(next_item)
+    if files:
+        (folder / "_manifest.json").write_text(
+            json.dumps([item.to_dict() for item in copied], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (folder / "_origin.json").write_text(
+            json.dumps(origin or {}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (folder / "README.txt").write_text(
+            textwrap.dedent(
+                """\
+                HIGH RISK AUTH SNAPSHOT
+
+                This directory contains Codex authentication material copied
+                from a Codex home. Treat this bundle like a password. Use it
+                only for same-account cross-device migration and delete it
+                after the destination device is working.
+                """
+            ),
+            encoding="utf-8",
+        )
+    return copied
 
 
 def _href(path: str) -> str:
@@ -1958,6 +2082,8 @@ def export_one(
     include_files: bool,
     include_context: bool,
     include_reasoning: bool,
+    auth_files: Optional[list[AuthFile]] = None,
+    auth_origin: Optional[dict[str, Any]] = None,
 ) -> Optional[Path]:
     if not session.transcript_path.exists():
         print(f"warn: skipping {session.session_id}: transcript not found", file=sys.stderr)
@@ -1977,7 +2103,7 @@ def export_one(
 
     target = output_root / meta.session_id
     target.mkdir(parents=True, exist_ok=True)
-    for folder in ("inputs", "outputs", "attachments", "assets"):
+    for folder in ("inputs", "outputs", "attachments", "assets", "auth"):
         stale = target / folder
         if stale.exists():
             if stale.is_dir():
@@ -1992,6 +2118,7 @@ def export_one(
     copied_files = copy_touched_files(touched, target) if include_files else []
     if include_files:
         write_outputs_manifest(target, copied_output_refs, copied_files)
+    copied_auth = copy_auth_files(auth_files or [], target, auth_origin) if auth_files else []
 
     formats = list(formats)
     if "html" in formats:
@@ -2003,7 +2130,7 @@ def export_one(
     if "csv" in formats:
         write_csv(target / "session.csv", archive_blocks)
 
-    _write_bundle_readme(target, meta, display_blocks, archive_blocks, copied_inputs, copied_output_refs, copied_files, formats)
+    _write_bundle_readme(target, meta, display_blocks, archive_blocks, copied_inputs, copied_output_refs, copied_files, copied_auth, formats)
     return target
 
 
@@ -2015,6 +2142,7 @@ def _write_bundle_readme(
     inputs: list[Attachment],
     output_refs: list[Attachment],
     files: list[TouchedFile],
+    auth_files: list[AuthFile],
     formats: list[str],
 ) -> None:
     n_user = sum(1 for b in display_blocks if b.kind == "text" and b.role == "user")
@@ -2038,6 +2166,8 @@ def _write_bundle_readme(
     n_outputs = len(output_refs) + len(files)
     if n_outputs:
         lines.append(f"- Outputs: {n_outputs}")
+    if auth_files:
+        lines.append(f"- Auth snapshot files: {len(auth_files)}")
     lines += ["", "## Files in this bundle", ""]
     if "html" in formats:
         lines.append("- `session.html` - formatted browser view")
@@ -2053,6 +2183,8 @@ def _write_bundle_readme(
         lines.append("- `inputs/` - readable user-provided or user-mentioned files")
     if n_outputs:
         lines.append("- `outputs/` - readable generated, viewed, written, or edited files")
+    if auth_files:
+        lines.append("- `auth/` - HIGH RISK optional Codex authentication snapshot")
     (target / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -2072,13 +2204,44 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def confirm_auth_export(codex_home: Path, auth_files: list[AuthFile]) -> bool:
+    existing = [item for item in auth_files if item.exists]
+    missing = [item for item in auth_files if not item.exists]
+    print("", file=sys.stderr)
+    print("WARNING: you enabled --include-auth", file=sys.stderr)
+    print("The export bundle will contain Codex authentication material, including auth.json/refresh tokens when present.", file=sys.stderr)
+    print("Anyone who gets this bundle may be able to act as this Codex account until you rotate/revoke the credentials.", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Use only for:", file=sys.stderr)
+    print("  - moving your own setup to another machine you control", file=sys.stderr)
+    print("  - an encrypted personal backup stored in a password manager, GPG, age, or encrypted disk", file=sys.stderr)
+    print("Do not:", file=sys.stderr)
+    print("  - send the bundle to another person", file=sys.stderr)
+    print("  - upload it unencrypted to cloud drives, chat, or email", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(f"Codex home: {codex_home}", file=sys.stderr)
+    print(f"Auth files that will be copied: {len(existing)}", file=sys.stderr)
+    for item in existing:
+        print(f"  - {item.relative_path} ({_human_size(item.size)})", file=sys.stderr)
+    if missing:
+        print(f"Auth files not found: {len(missing)}", file=sys.stderr)
+        for item in missing:
+            print(f"  - {item.relative_path}", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(f'Type "{AUTH_CONFIRM_PHRASE}" to continue: ', end="", file=sys.stderr, flush=True)
+    answer = sys.stdin.readline()
+    return answer.strip() == AUTH_CONFIRM_PHRASE
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     formats = [f.strip().lower() for f in args.formats.split(",") if f.strip()]
     invalid = [f for f in formats if f not in SUPPORTED_FORMATS]
     if invalid:
         print(f"error: unknown format(s): {', '.join(invalid)}", file=sys.stderr)
         return 2
-
+    if args.yes_i_know_this_is_risky and not args.include_auth:
+        print("error: --yes-i-know-this-is-risky is only valid with --include-auth", file=sys.stderr)
+        return 2
     codex_home = _expand_path(args.codex_home)
     root = _expand_path(args.sessions_root).resolve() if args.sessions_root else (codex_home / "sessions").resolve()
     index = _expand_path(args.index).resolve() if args.index else (codex_home / "session_index.jsonl").resolve()
@@ -2096,6 +2259,16 @@ def cmd_export(args: argparse.Namespace) -> int:
 
     output_root = _expand_path(args.output).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+    auth_files = collect_auth_files(codex_home, args.auth_file or []) if args.include_auth else []
+    auth_origin = build_auth_origin(codex_home) if args.include_auth else None
+    if args.include_auth:
+        if not args.yes_i_know_this_is_risky and not confirm_auth_export(codex_home, auth_files):
+            print("error: auth export cancelled; no bundle was written with auth files", file=sys.stderr)
+            print("for non-interactive automation, rerun with --include-auth --yes-i-know-this-is-risky", file=sys.stderr)
+            return 2
+        print(f"warning: {AUTH_RISK_WARNING}", file=sys.stderr)
+        existing = sum(1 for item in auth_files if item.exists)
+        print(f"warning: selected {existing}/{len(auth_files)} auth file(s) from {codex_home}", file=sys.stderr)
 
     exported = 0
     for session in targets:
@@ -2106,6 +2279,8 @@ def cmd_export(args: argparse.Namespace) -> int:
             include_files=not args.no_files,
             include_context=args.include_context,
             include_reasoning=args.include_reasoning,
+            auth_files=auth_files,
+            auth_origin=auth_origin,
         )
         if target:
             print(f"exported {session.session_id} -> {target}")
@@ -2178,6 +2353,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-reasoning",
         action="store_true",
         help="include readable Codex reasoning summary/content blocks; raw transcript always remains lossless",
+    )
+    pe.add_argument(
+        "--include-auth",
+        action="store_true",
+        help="HIGH RISK: include Codex authentication files in auth/ for same-account cross-device migration",
+    )
+    pe.add_argument(
+        "--yes-i-know-this-is-risky",
+        dest="yes_i_know_this_is_risky",
+        action="store_true",
+        help="skip the interactive auth warning for automation; valid only with --include-auth",
+    )
+    pe.add_argument(
+        "--i-understand-auth-risk",
+        dest="yes_i_know_this_is_risky",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    pe.add_argument(
+        "--auth-file",
+        action="append",
+        default=[],
+        metavar="REL",
+        help="extra auth-related file under <codex-home> to include with --include-auth; may be repeated",
     )
     pe.set_defaults(func=cmd_export)
     return p

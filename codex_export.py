@@ -108,6 +108,12 @@ AUTH_RISK_WARNING = (
     "and delete it when finished."
 )
 AUTH_CONFIRM_PHRASE = "I UNDERSTAND"
+DELETE_LOCAL_RISK_WARNING = (
+    "HIGH RISK: --delete-local-after-export removes the exported session from the local Codex history. "
+    "It deletes the source transcript JSONL and removes matching entries from session_index.jsonl after export succeeds. "
+    "It does not delete project/workspace files."
+)
+DELETE_LOCAL_CONFIRM_PHRASE = "DELETE LOCAL CODEX SESSION"
 
 
 @dataclass
@@ -212,6 +218,14 @@ class AuthFile:
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
+
+
+@dataclass
+class LocalDeleteResult:
+    deleted_transcripts: int = 0
+    missing_transcripts: int = 0
+    removed_index_rows: int = 0
+    errors: list[str] = field(default_factory=list)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -2233,6 +2247,89 @@ def confirm_auth_export(codex_home: Path, auth_files: list[AuthFile]) -> bool:
     return answer.strip() == AUTH_CONFIRM_PHRASE
 
 
+def confirm_delete_local_after_export(targets: list[CodexSession], index: Path, sessions_root: Path) -> bool:
+    print("", file=sys.stderr)
+    print("WARNING: you enabled --delete-local-after-export", file=sys.stderr)
+    print(DELETE_LOCAL_RISK_WARNING, file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Delete scope after successful export:", file=sys.stderr)
+    print(f"  - source transcript JSONL files under: {sessions_root}", file=sys.stderr)
+    print(f"  - matching session_index.jsonl rows in: {index}", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("The exported bundle remains in the output directory. Project/workspace files are not deleted.", file=sys.stderr)
+    print("Use this only after you intentionally want the exported sessions removed from local Codex history.", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(f"Sessions selected for post-export local deletion: {len(targets)}", file=sys.stderr)
+    shown = targets[:20]
+    for session in shown:
+        print(f"  - {session.session_id}  {session.display_title}", file=sys.stderr)
+        print(f"    {session.transcript_path}", file=sys.stderr)
+    if len(targets) > len(shown):
+        print(f"  ... {len(targets) - len(shown)} more session(s)", file=sys.stderr)
+    print("", file=sys.stderr)
+    print(f'Type "{DELETE_LOCAL_CONFIRM_PHRASE}" to continue: ', end="", file=sys.stderr, flush=True)
+    answer = sys.stdin.readline()
+    return answer.strip() == DELETE_LOCAL_CONFIRM_PHRASE
+
+
+def _write_index_without_sessions(index: Path, session_ids: set[str]) -> int:
+    if not index.exists():
+        return 0
+    rows = _read_jsonl(index)
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    for row in rows:
+        if str(row.get("id") or "") in session_ids:
+            removed += 1
+            continue
+        kept.append(row)
+    if not removed:
+        return 0
+    index.parent.mkdir(parents=True, exist_ok=True)
+    with index.open("w", encoding="utf-8", newline="\n") as f:
+        for row in kept:
+            f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return removed
+
+
+def _prune_empty_session_dirs(transcript_path: Path, sessions_root: Path) -> None:
+    try:
+        stop = sessions_root.resolve(strict=False)
+        current = transcript_path.parent.resolve(strict=False)
+    except OSError:
+        return
+    while current != stop and stop in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
+def delete_local_exported_sessions(targets: list[CodexSession], index: Path, sessions_root: Path) -> LocalDeleteResult:
+    result = LocalDeleteResult()
+    seen_paths: set[Path] = set()
+    for session in targets:
+        path = session.transcript_path
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        try:
+            if path.exists():
+                path.unlink()
+                result.deleted_transcripts += 1
+                _prune_empty_session_dirs(path, sessions_root)
+            else:
+                result.missing_transcripts += 1
+        except OSError as exc:
+            result.errors.append(f"{path}: {exc}")
+    try:
+        result.removed_index_rows = _write_index_without_sessions(index, {s.session_id for s in targets})
+    except OSError as exc:
+        result.errors.append(f"{index}: {exc}")
+    return result
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     formats = [f.strip().lower() for f in args.formats.split(",") if f.strip()]
     invalid = [f for f in formats if f not in SUPPORTED_FORMATS]
@@ -2256,6 +2353,10 @@ def cmd_export(args: argparse.Namespace) -> int:
         for s in targets:
             print(f"  {s.session_id}  {s.display_title}", file=sys.stderr)
         return 1
+    if args.delete_local_after_export:
+        if not confirm_delete_local_after_export(targets, index, root):
+            print("error: export cancelled; no local session data was deleted", file=sys.stderr)
+            return 2
 
     output_root = _expand_path(args.output).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
@@ -2271,6 +2372,7 @@ def cmd_export(args: argparse.Namespace) -> int:
         print(f"warning: selected {existing}/{len(auth_files)} auth file(s) from {codex_home}", file=sys.stderr)
 
     exported = 0
+    exported_sessions: list[CodexSession] = []
     for session in targets:
         target = export_one(
             session=session,
@@ -2285,6 +2387,20 @@ def cmd_export(args: argparse.Namespace) -> int:
         if target:
             print(f"exported {session.session_id} -> {target}")
             exported += 1
+            exported_sessions.append(session)
+    if args.delete_local_after_export and exported_sessions:
+        result = delete_local_exported_sessions(exported_sessions, index, root)
+        print(
+            "deleted local session data: "
+            f"{result.deleted_transcripts} transcript(s), "
+            f"{result.removed_index_rows} index row(s)"
+        )
+        if result.missing_transcripts:
+            print(f"warning: {result.missing_transcripts} transcript file(s) were already missing", file=sys.stderr)
+        for error in result.errors:
+            print(f"error: failed to delete local session data: {error}", file=sys.stderr)
+        if result.errors:
+            return 1
     return 0 if exported else 1
 
 
@@ -2377,6 +2493,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="REL",
         help="extra auth-related file under <codex-home> to include with --include-auth; may be repeated",
+    )
+    pe.add_argument(
+        "--delete-local-after-export",
+        action="store_true",
+        help="HIGH RISK: after successful export, delete the source transcript and remove matching session_index.jsonl rows",
     )
     pe.set_defaults(func=cmd_export)
     return p

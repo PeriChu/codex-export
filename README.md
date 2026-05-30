@@ -28,6 +28,8 @@ machine-readable-summary:
     import_skip: "codex-import import ./exports/<session-id> --skip-auth"
     import_interactive: "codex-import import ./exports/<session-id> --include-auth"
     import_automation: "codex-import import ./exports/<session-id> --include-auth --yes-i-know-this-is-risky"
+  high_risk_delete_flag:
+    export_then_delete_local: "codex-export export latest --delete-local-after-export"
 -->
 
 Zero-dependency tools for backing up and restoring local Codex conversations.
@@ -203,6 +205,18 @@ codex-export export latest --formats html,json
 
 ```bash
 codex-export export latest --no-files
+```
+
+导出成功后删除本机 Codex 会话记录：
+
+```bash
+codex-export export latest --output ./exports --delete-local-after-export
+```
+
+这是高风险模式。它只会在导出成功后删除对应的本地 Codex transcript JSONL，并从 `session_index.jsonl` 删除匹配行；不会删除项目/workspace 文件，也不会删除刚生成的导出 bundle。启用后必须手动输入：
+
+```text
+DELETE LOCAL CODEX SESSION
 ```
 
 包含隐藏的 subagent/background rollout：
@@ -523,6 +537,18 @@ Transcript-only bundle, without copied input/output files:
 
 ```bash
 codex-export export latest --no-files
+```
+
+Export and then remove the local Codex session record:
+
+```bash
+codex-export export latest --output ./exports --delete-local-after-export
+```
+
+This is a high-risk mode. It deletes the matching local Codex transcript JSONL and removes matching rows from `session_index.jsonl` only after export succeeds. It does not delete project/workspace files, and it does not delete the generated export bundle. You must type this exact confirmation phrase:
+
+```text
+DELETE LOCAL CODEX SESSION
 ```
 
 Include hidden subagent/background rollouts:
